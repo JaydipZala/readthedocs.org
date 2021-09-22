@@ -1,4 +1,5 @@
 """Project forms."""
+import json
 from random import choice
 from re import fullmatch
 from urllib.parse import urlparse
@@ -461,6 +462,50 @@ class WebHookForm(forms.ModelForm):
     class Meta:
         model = WebHook
         fields = ['url']
+
+
+class GenericWebHookForm(forms.ModelForm):
+
+    project = forms.CharField(widget=forms.HiddenInput(), required=False)
+
+    class Meta:
+        model = WebHook
+        fields = ['project', 'url', 'events', 'payload', 'secret']
+        widgets = {
+            'events': forms.CheckboxSelectMultiple,
+        }
+
+    def __init__(self, *args, **kwargs):
+        self.project = kwargs.pop('project', None)
+        super().__init__(*args, **kwargs)
+
+        if self.instance and self.instance.pk:
+            # Show secret in the detail form, but as readonly.
+            self.fields['secret'].disabled = True
+        else:
+            # Don't show the secret in the creation form.
+            del self.fields['secret']
+            self.fields['payload'].initial = json.dumps({
+                'event': '${event}',
+                'name': '${project.name}',
+                'slug': '${project.slug}',
+                'version': '${version.slug}',
+                'commit': '${build.id}',
+                'commit': '${build.commit}',
+            }, indent=2)
+
+    def clean_project(self):
+        return self.project
+
+    def clean_payload(self):
+        """Check if the payload is a valid json object and format it."""
+        payload = self.cleaned_data['payload']
+        try:
+            payload = json.loads(payload)
+            payload = json.dumps(payload, indent=2)
+        except Exception:
+            raise forms.ValidationError(_('The payload must be a valid JSON object'))
+        return payload
 
 
 class TranslationBaseForm(forms.Form):

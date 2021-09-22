@@ -19,7 +19,7 @@ from django.urls import reverse
 from django.utils import timezone
 from django.utils.safestring import mark_safe
 from django.utils.translation import ugettext_lazy as _
-from django.views.generic import ListView, TemplateView, View
+from django.views.generic import ListView, TemplateView
 from formtools.wizard.views import SessionWizardView
 from vanilla import (
     CreateView,
@@ -41,7 +41,6 @@ from readthedocs.builds.models import (
 )
 from readthedocs.core.history import UpdateChangeReasonPostView
 from readthedocs.core.mixins import ListViewWithForm, PrivateViewMixin
-from readthedocs.core.utils import trigger_build
 from readthedocs.core.utils.extend import SettingsOverrideObject
 from readthedocs.integrations.models import HttpExchange, Integration
 from readthedocs.oauth.services import registry
@@ -53,6 +52,7 @@ from readthedocs.projects.forms import (
     DomainForm,
     EmailHookForm,
     EnvironmentVariableForm,
+    GenericWebHookForm,
     IntegrationForm,
     ProjectAdvancedForm,
     ProjectAdvertisingForm,
@@ -581,6 +581,65 @@ class ProjectNotificationsDelete(ProjectNotificationsMixin, GenericView):
             except WebHook.DoesNotExist:
                 raise Http404
         return HttpResponseRedirect(self.get_success_url())
+
+
+class WebHookMixin(ProjectAdminMixin, PrivateViewMixin):
+
+    model = WebHook
+    lookup_url_kwarg = 'webhook_pk'
+    form_class = GenericWebHookForm
+
+    def get_success_url(self):
+        return reverse(
+            'projects_webhooks',
+            args=[self.get_project().slug],
+        )
+
+
+class WebHookList(WebHookMixin, ListView):
+
+    pass
+
+
+class WebHookCreate(WebHookMixin, CreateView):
+
+    def get_success_url(self):
+        return reverse(
+            'projects_webhooks_edit',
+            args=[self.get_project().slug, self.object.pk],
+        )
+
+
+class WebHookUpdate(WebHookMixin, UpdateView):
+
+    def get_success_url(self):
+        return reverse(
+            'projects_webhooks_edit',
+            args=[self.get_project().slug, self.object.pk],
+        )
+
+
+class WebHookDelete(WebHookMixin, DeleteView):
+
+    http_method_names = ['post']
+
+
+class WebHookExchangeDetail(WebHookMixin, DetailView):
+
+    model = HttpExchange
+    lookup_url_kwarg = 'exchange_pk'
+    webhook_url_kwarg = 'webhook_pk'
+    template_name = 'projects/webhook_exchange_detail.html'
+
+    def get_queryset(self):
+        return self.model.objects.filter(webhook=self.get_webhook())
+
+    def get_webhook(self):
+        return get_object_or_404(
+            WebHook,
+            pk=self.kwargs[self.webhook_url_kwarg],
+            project=self.get_project(),
+        )
 
 
 class ProjectTranslationsMixin(ProjectAdminMixin, PrivateViewMixin):

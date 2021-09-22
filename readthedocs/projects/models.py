@@ -1,5 +1,7 @@
 """Project models."""
 import fnmatch
+import hashlib
+import hmac
 import logging
 import os
 import re
@@ -10,10 +12,12 @@ from allauth.socialaccount.providers import registry as allauth_registry
 from django.conf import settings
 from django.conf.urls import include
 from django.contrib.auth.models import User
+from django.contrib.contenttypes.fields import GenericRelation
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.db.models import Prefetch
 from django.urls import re_path, reverse
+from django.utils.crypto import get_random_string
 from django.utils.functional import cached_property
 from django.utils.translation import ugettext_lazy as _
 from django.views import defaults
@@ -1465,14 +1469,105 @@ class EmailHook(Notification):
         return self.email
 
 
-class WebHook(Notification):
-    url = models.URLField(
-        max_length=600,
-        help_text=_('URL to send the webhook to'),
+class WebHookEvent(models.Model):
+
+    BUILD_TRIGGERED = 'build:triggered'
+    BUILD_PASSED = 'build:passed'
+    BUILD_FAILED = 'build:failed'
+
+    EVENTS = (
+        (BUILD_TRIGGERED, _('Build triggered')),
+        (BUILD_PASSED, _('Build passed')),
+        (BUILD_FAILED, _('Build failed')),
+    )
+
+    name = models.CharField(
+        max_length=256,
+        unique=True,
+        choices=EVENTS,
     )
 
     def __str__(self):
-        return self.url
+        return self.name
+
+
+class WebHook(Notification, TimeStampedModel):
+
+    url = models.URLField(
+        _('URL'),
+        max_length=600,
+        help_text=_('URL to send the webhook to'),
+    )
+    secret = models.CharField(
+        help_text=_('Secret used to sign the payload of the webhook'),
+        max_length=255,
+        blank=True,
+        null=True,
+    )
+    events = models.ManyToManyField(
+        WebHookEvent,
+        related_name='webhooks',
+        help_text=_('Events to subscribe'),
+    )
+    payload = models.TextField(
+        _('JSON payload'),
+        help_text=_(
+            'JSON payload to send to the webhook. '
+            'Check the docs for available substitutions.',
+        ),
+        blank=True,
+        null=True,
+    )
+    exchanges = GenericRelation(
+        'integrations.HttpExchange',
+        related_query_name='webhook',
+    )
+
+    SUBSTITUTIONS = (
+        ('${event}', _('Event that triggered the request')),
+        ('${build.id}', _('Build ID')),
+        ('${build.commit}', _('Commit being built')),
+        ('${project.slug}', _('Project slug')),
+        ('${project.name}', _('Project name')),
+        ('${version.id}', _('Version ID')),
+        ('${version.slug}', _('Version slug')),
+    )
+
+    def save(self, *args, **kwargs):
+        if not self.secret:
+            self.secret = get_random_string(length=32)
+        super().save(*args, **kwargs)
+
+    def get_payload(self, version, build, event):
+        if not self.payload:
+            return None
+
+        project = version.project
+        substitutions = {
+            '${event}': event,
+            '${build.id}': build.id,
+            '${build.commit}': build.commit,
+            '${project.slug}': project.slug,
+            '${project.name}': project.name,
+            '${version.slug}': version.slug,
+        }
+        payload = self.payload
+        # Small protection for DDoS.
+        max_substitutions = 9
+        for substitution, value in substitutions.items():
+            payload = payload.replace(substitution, str(value), max_substitutions)
+        return payload
+
+    def sign_payload(self, payload):
+        digest = hmac.new(
+            self.secret.encode(),
+            msg=payload.encode(),
+            digestmod=hashlib.sha1,
+        )
+        return digest.hexdigest()
+
+    def __str__(self):
+        return f'{self.project.slug} {self.url}'
 
 
 class Domain(TimeStampedModel, models.Model):

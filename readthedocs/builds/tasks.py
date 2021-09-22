@@ -1,10 +1,14 @@
+import itertools
 import json
 import logging
 from datetime import datetime, timedelta
 from io import BytesIO
 
+import requests
 from celery import Task
 from django.conf import settings
+from django.urls import reverse
+from django.utils.translation import ugettext_lazy as _
 
 from readthedocs.api.v2.serializers import BuildSerializer
 from readthedocs.api.v2.utils import (
@@ -25,11 +29,11 @@ from readthedocs.builds.constants import (
 from readthedocs.builds.models import Build, Version
 from readthedocs.builds.utils import memcache_lock
 from readthedocs.core.permissions import AdminPermission
-from readthedocs.core.utils import trigger_build
-from readthedocs.oauth.models import RemoteRepository
+from readthedocs.core.utils import send_email, trigger_build
+from readthedocs.integrations.models import HttpExchange
 from readthedocs.oauth.notifications import GitBuildStatusFailureNotification
 from readthedocs.projects.constants import GITHUB_BRAND, GITLAB_BRAND
-from readthedocs.projects.models import Project
+from readthedocs.projects.models import Project, WebHookEvent
 from readthedocs.storage import build_commands_storage
 from readthedocs.worker import app
 
@@ -453,3 +457,150 @@ def send_build_status(build_pk, commit, status, link_to_build=False):
             build.project.slug
         )
         return False
+
+
+@app.task(queue='web')
+def send_build_notifications(version_pk, build_pk, event):
+    version = Version.objects.get_object_or_log(pk=version_pk)
+
+    if not version or version.type == EXTERNAL:
+        return
+
+    build = Build.objects.get(pk=build_pk)
+
+    sender = NotificationSender(
+        version=version,
+        build=build,
+        event=event,
+    )
+    sender.send()
+
+class NotificationSender:
+
+    def __init__(self, version, build, event):
+        self.version = version
+        self.build = build
+        self.project = version.project
+        self.event = event
+
+    def send(self):
+        if self.event == WebHookEvent.BUILD_FAILED:
+            email_addresses = (
+                self.project.emailhook_notifications.all()
+                .values_list('email', flat=True)
+            )
+            for email in email_addresses:
+                try:
+                    self.send_email(email)
+                except Exception:
+                    log.exception(
+                        'Failed to send email notification. email=%s',
+                        email,
+                    )
+
+        old_webhooks = []
+        if self.event in [WebHookEvent.BUILD_FAILED, WebHookEvent.BUILD_PASSED]:
+            old_webhooks = (
+                self.project.webhook_notifications
+                .filter(events__isnull=True)
+            )
+
+        new_webhooks = (
+            self.project.webhook_notifications
+            .filter(events__name=self.event)
+        )
+        for webhook in itertools.chain(old_webhooks, new_webhooks):
+            try:
+                self.send_webhook(webhook)
+            except Exception:
+                log.exception(
+                    'Failed to send webhook. id=%s',
+                    webhook.id,
+                )
+
+    def send_email(self, email):
+        """Send email notifications for build failure."""
+        # We send only what we need from the Django model objects here to avoid
+        # serialization problems in the ``readthedocs.core.tasks.send_email_task``
+        context = {
+            'version': {
+                'verbose_name': self.version.verbose_name,
+            },
+            'project': {
+                'name': self.project.name,
+            },
+            'build': {
+                'pk': self.build.pk,
+                'error': self.build.error,
+            },
+            'build_url': 'https://{}{}'.format(
+                settings.PRODUCTION_DOMAIN,
+                self.build.get_absolute_url(),
+            ),
+            'unsub_url': 'https://{}{}'.format(
+                settings.PRODUCTION_DOMAIN,
+                reverse('projects_notifications', args=[self.project.slug]),
+            ),
+        }
+
+        if self.build.commit:
+            title = _(
+                'Failed: {project[name]} ({commit})',
+            ).format(commit=self.build.commit[:8], **context)
+        else:
+            title = _('Failed: {project[name]} ({version[verbose_name]})').format(
+                **context
+            )
+
+        log.debug(
+            'Sending email notification. project=%s version=%s build=%s',
+            self.project.slug, self.version.slug, self.build.id,
+        )
+        send_email(
+            email,
+            title,
+            template='projects/email/build_failed.txt',
+            template_html='projects/email/build_failed.html',
+            context=context,
+        )
+
+    def send_webhook(self, webhook):
+        """Send webhook notification for project webhook."""
+        payload = webhook.get_payload(
+            version=self.version,
+            build=self.build,
+            event=self.event,
+        )
+        if not payload:
+            payload = json.dumps({
+                'name': self.project.name,
+                'slug': self.project.slug,
+                'build': {
+                    'id': self.build.id,
+                    'commit': self.build.commit,
+                    'state': self.build.state,
+                    'success': self.build.success,
+                    'date': self.build.date.strftime('%Y-%m-%d %H:%M:%S'),
+                },
+            })
+
+        headers = {'content-type': 'application/json'}
+        if webhook.secret:
+            headers['X-Hub-Signature'] = webhook.sign_payload(payload)
+
+        try:
+            log.debug(
+                'Sending webhook notification. project=%s version=%s build=%s',
+                self.project.slug, self.version.slug, self.build.pk,
+            )
+            response = requests.post(
+                webhook.url,
+                data=payload,
+                headers=headers,
+            )
+            HttpExchange.objects.from_requests_exchange(
+                response=response,
+                related_object=webhook,
+            )
+        except Exception:
+            log.exception('Failed to POST on webhook url: url=%s', webhook.url)
